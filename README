@@ -1,0 +1,3 @@
+
+# Example of encrypting and decrypting in one go
+cat /etc/passwd | ./backupcrypt -f ~/.backup_key | ./backupcrypt -d

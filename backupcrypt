@@ -1,0 +1,170 @@
+#!/usr/bin/perl -w
+use strict;
+use Getopt::Std;
+use Digest::MD5 qw(md5_hex);
+
+my $program = $0;
+$program =~ s%^.*/|\..*$%%g; # Cleanup name
+
+my $program_version = "0.1";
+
+# Used to check the command read from header when restoring - hopefully foiling any attempt at hash collisions
+my $cmd_regex = qr/^openssl [a-z0-9-]{2,30} -S '[a-f0-9]{4,16}' -[de] -kfile '[[:print:]]{1,256}'$/;
+
+
+my %opt;
+my $cmd;
+
+
+sub fatal {
+	my $error = shift;
+	print STDERR "FATAL: $error\n";
+	exit 254;
+}
+
+sub usage {
+	my $error = shift;
+	
+	print STDERR "$program v. $program_version - Copyright (C) 2014 - Dan Faerch
+Makes encryption that can be deduplicated or handled incrementally. Reads from STDIN and encrypts/decrypts to STDOUT.
+Usage:
+	-f	: keyfile - file containing your encryption-key/passphrase
+	-d	: decrypt
+	-e	: encrypt (default)
+	-v	: print versbose information to STDERR
+	-h	: this help message
+
+	Example usage:
+		# Doing a 'tar', encrypting and backing up using 'bup' to a remote server
+		tar -cf - /etc/ | $program -f ~/.backup_key | bup split -n enc-etc -r user\@192.168.1.2:
+		
+		# Restoring and decrypting
+		bup join enc-etc -r user\@192.168.1.2: | $program -d | tar -xf - -C /tmp/restore/
+
+	";
+	print STDERR "\nError: $error\n" if (defined $error);
+	exit 1;
+}
+
+# Convinience function, to allow replacing MD5 with somthing heavier at 
+# a later time. # At the moment, MD5 is in all default installs i've checked. 
+# SHA1 is not.
+# I try to mitigate the MD5 collision issues by doing the following:
+# 1. Prefixing the plain-text, with the length of the plain-text before digestion.
+# 2. Matching plain-text agains a pretty strict regex.
+#
+#  With my knowledge of how collisions works, i do not see how MD5 collisions could be generated.
+sub digest {
+   my $str = shift;
+   return md5_hex($str);
+}
+
+usage() if ($opt{'h'});
+
+getopts('hdevf:S:', \%opt);
+
+my $MODE='e';
+
+usage("Cannot speficy both -d and -e") if ($opt{'d'} && $opt{'e'});
+$MODE='d' if ($opt{'d'});
+$MODE='e' if ($opt{'e'});
+
+
+# Check for header, if this is decryption
+my $digest;
+my $org_cmd;
+if ($MODE eq 'd') {
+    my $header = <STDIN>;
+    chomp($header);
+    
+    fatal("No header found or recognized") unless $header =~ m/^DDCRYPT1:(.+):([a-f0-9]{32,255})$/;
+
+    $cmd = $1;
+    $org_cmd = $cmd;
+    $digest = $2;
+    
+    
+    $cmd =~ s/ -e / -d /;
+
+    fatal("Sanitazion regex match failed on header") unless $cmd =~ $cmd_regex;
+
+    #keyfile manually specified
+    if ($opt{'f'}) {
+      $cmd =~ s/ -kfile \S+/ -kfile $opt{'f'}/;
+    # Get key file from header
+    } else {
+      fatal("Failed parsing header kfile") unless $cmd =~ m/ -kfile (\S+)/;
+      $opt{'f'} = $1;
+      $opt{'f'} =~ s/^(['"])(.*)\1$/$2/g; # Strip ' or "
+    }
+    print STDERR "Got header: $header\n" if ($opt{'v'});
+}
+
+
+usage("No keyfile specified") unless $opt{'f'};
+usage("Keyfile not found: "  .$opt{'f'}) unless -f $opt{'f'};
+usage("Keyfile not readable" .$opt{'f'}) unless -r $opt{'f'};
+
+# Check that file is not world-readable (or acutally, world-anything)
+my $perm = (stat($opt{'f'}))[2];
+$perm = sprintf "%04o", $perm &07777;
+print STDERR "WARN: Keyfile file-permissions too open ($perm). Recommended: chmod 0600 ".$opt{'f'}."\n" unless ($perm =~ m/0$/);
+
+my $key;
+
+if (open(F,$opt{'f'})) {
+	 usage('Keyfile must contain one line of data') unless ($key = <F>);
+	 usage('Keyfile should ONLY contain one line')  if     (<F>);
+	 usage('Key must be > 8 chars')                 if     (length($key) < 9);
+}
+
+if ($MODE eq 'd') {
+  # Check that header has not been tampered with
+  fatal ('Header checsum does not match') if $digest ne digest(length($org_cmd)."|".$org_cmd."|".digest($key));
+}
+
+
+usage('Openssl must be installed and in path') unless `which openssl`; 
+
+
+
+#------------------------
+
+my $salt;
+# Get something unique to this machine (and static) to use for salt. (If a different salt was used, 
+# on every run, encryption wouldn't be deduplicatable)
+if (open(F,'/var/lib/dbus/machine-id')) {
+	$salt = <F>;
+	chomp($salt);
+	close(F);
+}
+# If machine-id wasnt found, use MAC of first interface.
+unless (defined $salt) {
+	my $res = `ifconfig -a`;
+	# Grab the MAC
+	if ($res =~ m/HWaddr (\S+)/) {
+		$res = $1;
+		$res =~ s/[^a-f0-9]//gi;
+		$salt = $res if ($res);
+	}
+}
+
+$salt =~ s/^.*(.{16})$/$1/ if (defined $salt); # OpenSSL Salt must be max 8 bytes.
+
+unless (defined $salt || length($salt) != 16) {
+	print STDERR "Unable to automatically get a salt. "; #Please specify manually using -S\n";
+	exit(254);
+}
+
+print STDERR "Salt: $salt\n" if ($opt{'v'});
+
+
+$cmd = "openssl aes-256-ofb -S '$salt' -$MODE -kfile '".$opt{'f'}."'" unless ($cmd);
+
+print STDERR "Exec: $cmd\n" if ($opt{'v'});
+fatal("Sanitazion regex match failed on \$cmd") unless $cmd =~ $cmd_regex;
+
+# Print header containing encryption command
+print "DDCRYPT1:".$cmd.":".digest(length($cmd)."|".$cmd."|".digest($key))."\n" if ($MODE eq 'e');
+
+exec($cmd);
